@@ -54,14 +54,11 @@
 #define PLAT_MASTER_WRITE_STACK_SIZE 1024
 #define STRAP_SET_TYPE 0x44 // 01000100
 #define TELEMETRY_MSG_MAX_LENGTH 32
+#define MSGQ_MAX_MSGS 8
 
 static bool command_reply_data_handle(void *arg);
 void set_bootstrap_element_handler();
 K_WORK_DEFINE(set_bootstrap_element_work, set_bootstrap_element_handler);
-
-K_THREAD_STACK_DEFINE(plat_master_write_stack, PLAT_MASTER_WRITE_STACK_SIZE);
-struct k_thread plat_master_write_thread;
-k_tid_t plat_master_write_tid;
 
 typedef struct __attribute__((__packed__)) {
 	uint8_t device_type;
@@ -169,8 +166,36 @@ typedef struct __attribute__((__packed__)) {
 	uint16_t set_value;
 } plat_power_capping_switch;
 
+typedef struct __attribute__((__packed__)) {
+    uint8_t bus;
+    uint8_t addr;
+    uint8_t data[32];
+    uint8_t read_len;
+    uint8_t write_len;
+	uint8_t rail;
+    uint8_t set_polling_value;
+	uint16_t set_value;
+    uint16_t set_switch_value;
+	uint16_t set_value_HC;
+	uint16_t set_value_LC;
+} plat_msg_t;
+
+typedef struct __attribute__((__packed__)) {
+    uint16_t rlen;
+    uint8_t rdata[MAX_I2C_TARGET_BUFF];
+} plat_i2c_msg_t;
+
 static uint8_t bootstrap_pin;
 static uint8_t user_setting_level;
+
+K_THREAD_STACK_DEFINE(plat_command_msgq_stack, PLAT_MASTER_WRITE_STACK_SIZE);
+K_THREAD_STACK_DEFINE(plat_master_write_stack, PLAT_MASTER_WRITE_STACK_SIZE);
+struct k_msgq plat_command_msgq;
+struct k_thread plat_command_msgq_thread;
+struct k_thread plat_master_write_thread;
+static char __aligned(4) plat_command_msgq_buffer[sizeof(plat_i2c_msg_t) * MSGQ_MAX_MSGS];
+k_tid_t plat_command_tid;
+k_tid_t plat_master_write_tid;
 
 LOG_MODULE_REGISTER(plat_i2c_target);
 /* I2C target init-enable table */
@@ -254,35 +279,27 @@ uint8_t get_vr_rail_by_control_vol_reg(uint8_t control_vol_reg)
 	return VR_RAIL_E_MAX;
 }
 
-void set_control_voltage_handler(struct k_work *work_item)
+void set_control_voltage_handler(plat_msg_t *msg)
 {
-	const plat_control_voltage *sensor_data =
-		CONTAINER_OF(work_item, plat_control_voltage, work);
-	uint8_t rail = sensor_data->rail;
-	uint16_t millivolt = sensor_data->set_value;
+	uint8_t rail = msg->rail;
+	uint16_t millivolt = msg->set_value;
 	LOG_DBG("Setting rail %x to %d mV", rail, millivolt);
 
 	plat_set_vout_command(rail, &millivolt, false, false);
 }
 
-void set_power_capping_handler(struct k_work *work_item)
+void set_power_capping_handler(plat_msg_t *msg)
 {
-	const plat_power_capping_set *sensor_data =
-		CONTAINER_OF(work_item, plat_power_capping_set, work);
-
-	uint16_t set_value_HC = sensor_data->set_value_HC;
-	uint16_t set_value_LC = sensor_data->set_value_LC;
+	uint16_t set_value_HC = msg->set_value_HC;
+	uint16_t set_value_LC = msg->set_value_LC;
 	plat_set_power_capping_command(POWER_CAPPING_INDEX_HC, &set_value_HC, false);
 	plat_set_power_capping_command(POWER_CAPPING_INDEX_LC, &set_value_LC, false);
 	// LOG_DBG("Power capping set HC: %d, LC: %d", set_value_HC, set_value_LC);
 }
 
-void set_power_capping_switch_handler(struct k_work *work_item)
+void set_power_capping_switch_handler(plat_msg_t *msg)
 {
-	const plat_power_capping_switch *sensor_data =
-		CONTAINER_OF(work_item, plat_power_capping_switch, work);
-
-	uint16_t set_value = sensor_data->set_value;
+	uint16_t set_value = msg->set_switch_value;
 	plat_set_power_capping_command(POWER_CAPPING_INDEX_SWITCH, &set_value, false);
 }
 
@@ -407,12 +424,9 @@ void set_bootstrap_element_handler()
 	}
 }
 
-void i2c_bridge_command_handler(struct k_work *work_item)
+void i2c_bridge_command_handler(plat_msg_t *msg)
 {
-	const plat_i2c_bridge_command_config *sensor_data_config =
-		CONTAINER_OF(work_item, plat_i2c_bridge_command_config, work);
-
-	int response_data_len = sensor_data_config->read_len;
+	int response_data_len = msg->read_len;
 
 	size_t table_size_41 = sizeof(plat_i2c_bridge_command_status);
 	plat_i2c_bridge_command_status *sensor_data_status =
@@ -432,11 +446,11 @@ void i2c_bridge_command_handler(struct k_work *work_item)
 
 	I2C_MSG i2c_msg = { 0 };
 	uint8_t retry = 5;
-	i2c_msg.bus = sensor_data_config->bus;
-	i2c_msg.target_addr = sensor_data_config->addr;
-	i2c_msg.tx_len = sensor_data_config->write_len;
-	i2c_msg.rx_len = sensor_data_config->read_len;
-	memcpy(&i2c_msg.data, sensor_data_config->data, sensor_data_config->write_len);
+	i2c_msg.bus = msg->bus;
+	i2c_msg.target_addr = msg->addr;
+	i2c_msg.tx_len = msg->write_len;
+	i2c_msg.rx_len = msg->read_len;
+	memcpy(&i2c_msg.data, msg->data, msg->write_len);
 	if (response_data_len == 0) {
 		if (i2c_master_write(&i2c_msg, retry)) {
 			LOG_ERR("Failed to write reg, bus: %d, addr: 0x%x, tx_len: 0x%x",
@@ -459,12 +473,9 @@ void i2c_bridge_command_handler(struct k_work *work_item)
 	}
 }
 
-void set_sensor_polling_handler(struct k_work *work_item)
+void set_sensor_polling_handler(plat_msg_t *msg)
 {
-	const plat_control_sensor_polling *sensor_data =
-		CONTAINER_OF(work_item, plat_control_sensor_polling, work);
-
-	int value = sensor_data->set_value;
+	int value = msg->set_polling_value;
 	if (!(value == 0 || value == 1)) {
 		LOG_ERR("set sensor_polling:%x is out of range", value);
 		return;
@@ -983,25 +994,22 @@ static bool command_reply_data_handle(void *arg)
 	return false;
 }
 
-void plat_master_write_thread_handler()
+void plat_command_msgq_handler()
 {
-	int rc = 0;
-	while (1) {
-		uint8_t rdata[MAX_I2C_TARGET_BUFF] = { 0 };
-		uint16_t rlen = 0;
-		rc = i2c_target_read(I2C_BUS7, rdata, sizeof(rdata), &rlen);
-		if (rc) {
-			LOG_ERR("i2c_target_read fail, ret %d", rc);
-			continue;
-		}
-		// LOG_DBG("rlen = %d", rlen);
-		// LOG_HEXDUMP_DBG(rdata, rlen, "");
-		if (rlen < 1) {
-			LOG_ERR("Received data too short");
-			continue;
-		}
+    plat_i2c_msg_t msg;
+    plat_msg_t msg_data;
 
-		uint8_t reg_offset = rdata[0];
+	while (1) {
+        if (k_msgq_get(&plat_command_msgq, &msg, K_FOREVER) != 0) {
+            LOG_WRN("Failed to get message from msgq!");
+            continue;
+        }
+
+        uint8_t *rdata = msg.rdata;
+        uint16_t rlen = msg.rlen;
+        uint8_t reg_offset = rdata[0];
+        memset(&msg_data, 0, sizeof(msg_data));
+
 		switch (reg_offset) {
 		case WRITE_STRAP_PIN_VALUE_REG: {
 			if (rlen != 3) {
@@ -1010,7 +1018,6 @@ void plat_master_write_thread_handler()
 			}
 			bootstrap_pin = rdata[1];
 			user_setting_level = rdata[2];
-			k_work_submit(&set_bootstrap_element_work);
 		} break;
 		case I2C_BRIDGE_COMMAND_REG: {
 			if (rlen < 5) {
@@ -1018,19 +1025,13 @@ void plat_master_write_thread_handler()
 				break;
 			}
 			size_t payload_len = rlen - 4;
-			size_t struct_size = sizeof(plat_i2c_bridge_command_config) + payload_len;
-			plat_i2c_bridge_command_config *sensor_data = malloc(struct_size);
-			if (!sensor_data) {
-				LOG_ERR("Memory allocation failed!");
-				break;
-			}
-			sensor_data->bus = rdata[1];
-			sensor_data->addr = rdata[2];
-			sensor_data->read_len = rdata[3];
-			sensor_data->write_len = payload_len;
-			memcpy(sensor_data->data, &rdata[4], payload_len);
-			k_work_init(&sensor_data->work, i2c_bridge_command_handler);
-			k_work_submit(&sensor_data->work);
+
+			msg_data.bus = rdata[1];
+			msg_data.addr = rdata[2];
+			msg_data.read_len = rdata[3];
+			msg_data.write_len = payload_len;
+			memcpy(msg_data.data, &rdata[4], payload_len);
+            i2c_bridge_command_handler(&msg_data);
 		} break;
 		case CONTROL_VOL_MINERVA_AEGIS_VR_ASIC_P0V75_VDDPHY_HBM0_HBM2_HBM4_REG:
 		case CONTROL_VOL_MINERVA_AEGIS_VR_ASIC_P0V75_VDDPHY_HBM1_HBM3_HBM5_REG:
@@ -1044,46 +1045,29 @@ void plat_master_write_thread_handler()
 				LOG_ERR("Invalid length for offset: 0x%02x", reg_offset);
 				break;
 			}
-			plat_control_voltage *sensor_data = malloc(sizeof(plat_control_voltage));
-			if (!sensor_data) {
-				LOG_ERR("Memory allocation failed!");
-				break;
-			}
-			sensor_data->rail = get_vr_rail_by_control_vol_reg(reg_offset);
-			sensor_data->set_value = rdata[1] | (rdata[2] << 8);
-			k_work_init(&sensor_data->work, set_control_voltage_handler);
-			k_work_submit(&sensor_data->work);
+
+			msg_data.rail = get_vr_rail_by_control_vol_reg(reg_offset);
+			msg_data.set_value = rdata[1] | (rdata[2] << 8);
+            set_control_voltage_handler(&msg_data);
 		} break;
 		case POWER_CAPPING_SET_VALUE_REG: {
 			if (rlen != 5) {
 				LOG_ERR("Invalid length for offset: 0x%02x", reg_offset);
 				break;
 			}
-			plat_power_capping_set *sensor_data =
-				malloc(sizeof(plat_power_capping_set));
-			if (!sensor_data) {
-				LOG_ERR("Memory allocation failed!");
-				break;
-			}
-			sensor_data->set_value_HC = rdata[1] | (rdata[2] << 8);
-			sensor_data->set_value_LC = rdata[3] | (rdata[4] << 8);
-			k_work_init(&sensor_data->work, set_power_capping_handler);
-			k_work_submit(&sensor_data->work);
+
+			msg_data.set_value_HC = rdata[1] | (rdata[2] << 8);
+			msg_data.set_value_LC = rdata[3] | (rdata[4] << 8);
+            set_power_capping_handler(&msg_data);
 		} break;
 		case POWER_CAPPING_SWITCH_ENABLE_REG: {
 			if (rlen != 2) {
 				LOG_ERR("Invalid length for offset: 0x%02x", reg_offset);
 				break;
 			}
-			plat_power_capping_switch *sensor_data =
-				malloc(sizeof(plat_power_capping_switch));
-			if (!sensor_data) {
-				LOG_ERR("Memory allocation failed!");
-				break;
-			}
-			sensor_data->set_value = rdata[1] & 0x01;
-			k_work_init(&sensor_data->work, set_power_capping_switch_handler);
-			k_work_submit(&sensor_data->work);
+
+			msg_data.set_switch_value = rdata[1] & 0x01;
+			set_power_capping_switch_handler(&msg_data);
 		} break;
 		case SET_SENSOR_POLLING_COMMAND_REG: {
 			if (rlen != 8) {
@@ -1099,15 +1083,9 @@ void plat_master_write_thread_handler()
 				LOG_ERR("Wrong command for set sensor_polling");
 				break;
 			}
-			plat_control_sensor_polling *sensor_data =
-				malloc(sizeof(plat_control_sensor_polling));
-			if (!sensor_data) {
-				LOG_ERR("Memory allocation failed!");
-				break;
-			}
-			sensor_data->set_value = rdata[7];
-			k_work_init(&sensor_data->work, set_sensor_polling_handler);
-			k_work_submit(&sensor_data->work);
+
+			msg_data.set_polling_value = rdata[7];
+			set_sensor_polling_handler(&msg_data);
 		} break;
 		default:
 			LOG_ERR("Unknown reg offset: 0x%02x", reg_offset);
@@ -1116,13 +1094,44 @@ void plat_master_write_thread_handler()
 	}
 }
 
-void plat_master_write_thread_init()
+void plat_master_write_thread_handler()
 {
-	plat_master_write_tid = k_thread_create(&plat_master_write_thread, plat_master_write_stack,
-						K_THREAD_STACK_SIZEOF(plat_master_write_stack),
-						plat_master_write_thread_handler, NULL, NULL, NULL,
-						CONFIG_MAIN_THREAD_PRIORITY, 0, K_NO_WAIT);
-	k_thread_name_set(&plat_master_write_thread, "plat_master_write_thread");
+    int rc = 0;
+    while (1) {
+        plat_i2c_msg_t msg;
+        memset(&msg, 0, sizeof(msg));
+
+        rc = i2c_target_read(I2C_BUS7, msg.rdata, sizeof(msg.rdata), &msg.rlen);
+        if (rc) {
+            LOG_ERR("i2c_target_read fail, ret %d", rc);
+            continue;
+        }
+        if (msg.rlen < 1) {
+            LOG_ERR("Received data too short");
+            continue;
+        }
+
+        if (k_msgq_put(&plat_command_msgq, &msg, K_NO_WAIT) != 0) {
+            LOG_WRN("plat_command_msgq is full, dropping packet!");
+        }
+    }
+}
+
+void plat_master_write_thread_init(void)
+{
+    k_msgq_init(&plat_command_msgq, plat_command_msgq_buffer, sizeof(plat_i2c_msg_t), MSGQ_MAX_MSGS);
+
+    plat_command_tid = k_thread_create(&plat_command_msgq_thread, plat_command_msgq_stack,
+                        K_THREAD_STACK_SIZEOF(plat_command_msgq_stack),
+                        plat_command_msgq_handler, NULL, NULL, NULL,
+                        CONFIG_MAIN_THREAD_PRIORITY, 0, K_NO_WAIT);
+    k_thread_name_set(plat_command_tid, "plat_command_msgq_thread");
+
+    plat_master_write_tid = k_thread_create(&plat_master_write_thread, plat_master_write_stack,
+                        K_THREAD_STACK_SIZEOF(plat_master_write_stack),
+                        plat_master_write_thread_handler, NULL, NULL, NULL,
+                        CONFIG_MAIN_THREAD_PRIORITY, 0, K_NO_WAIT);
+    k_thread_name_set(plat_master_write_tid, "plat_master_write_thread");
 }
 
 void plat_telemetry_table_init(void)
