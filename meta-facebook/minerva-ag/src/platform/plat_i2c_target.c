@@ -57,8 +57,6 @@
 #define MSGQ_MAX_MSGS 8
 
 static bool command_reply_data_handle(void *arg);
-void set_bootstrap_element_handler();
-K_WORK_DEFINE(set_bootstrap_element_work, set_bootstrap_element_handler);
 
 typedef struct __attribute__((__packed__)) {
 	uint8_t device_type;
@@ -116,15 +114,6 @@ typedef struct __attribute__((__packed__)) {
 } plat_fru_data;
 
 typedef struct __attribute__((__packed__)) {
-	struct k_work work;
-	uint8_t bus; // 0 base (0,1,2,3,4,..)
-	uint8_t addr; // 7 bit addr
-	uint8_t read_len;
-	uint8_t write_len; // include data[0]
-	uint8_t data[]; // data[0]: offset
-} plat_i2c_bridge_command_config;
-
-typedef struct __attribute__((__packed__)) {
 	uint8_t data_status;
 } plat_i2c_bridge_command_status;
 
@@ -133,38 +122,16 @@ typedef struct __attribute__((__packed__)) {
 	uint8_t response_data[];
 } plat_i2c_bridge_command_response_data;
 
-typedef struct __attribute__((__packed__)) {
-	struct k_work work;
-	uint8_t set_value;
-} plat_control_sensor_polling;
-
 typedef struct voltage_rail_mapping_sensor {
 	uint8_t control_vol_reg;
 	uint8_t vr_rail_e;
 } voltage_rail_mapping_sensor;
 
 typedef struct __attribute__((__packed__)) {
-	struct k_work work;
-	uint8_t rail;
-	uint16_t set_value;
-} plat_control_voltage;
-
-typedef struct __attribute__((__packed__)) {
 	uint8_t power_capping_reg;
 	uint8_t sensor_id;
 	uint16_t sensor_value; // Sensor value (2 bytes)
 } plat_power_capping;
-
-typedef struct __attribute__((__packed__)) {
-	struct k_work work;
-	uint16_t set_value_HC;
-	uint16_t set_value_LC;
-} plat_power_capping_set;
-
-typedef struct __attribute__((__packed__)) {
-	struct k_work work;
-	uint16_t set_value;
-} plat_power_capping_switch;
 
 typedef struct __attribute__((__packed__)) {
     uint8_t bus;
@@ -174,6 +141,8 @@ typedef struct __attribute__((__packed__)) {
     uint8_t write_len;
 	uint8_t rail;
     uint8_t set_polling_value;
+    uint8_t bootstrap_pin;
+    uint8_t user_setting_level;
 	uint16_t set_value;
     uint16_t set_switch_value;
 	uint16_t set_value_HC;
@@ -184,9 +153,6 @@ typedef struct __attribute__((__packed__)) {
     uint16_t rlen;
     uint8_t rdata[MAX_I2C_TARGET_BUFF];
 } plat_i2c_msg_t;
-
-static uint8_t bootstrap_pin;
-static uint8_t user_setting_level;
 
 K_THREAD_STACK_DEFINE(plat_command_msgq_stack, PLAT_MASTER_WRITE_STACK_SIZE);
 K_THREAD_STACK_DEFINE(plat_master_write_stack, PLAT_MASTER_WRITE_STACK_SIZE);
@@ -412,13 +378,13 @@ bool set_bootstrap_element(uint8_t bootstrap_pin, uint8_t user_setting_level)
 	return true;
 }
 
-void set_bootstrap_element_handler()
+void set_bootstrap_element_handler(plat_msg_t *msg)
 {
-	if (bootstrap_pin >= STRAP_INDEX_MAX) {
-		LOG_ERR("bootstrap_pin[%02x] is out of range", bootstrap_pin);
+	if (msg->bootstrap_pin >= STRAP_INDEX_MAX) {
+		LOG_ERR("bootstrap_pin[%02x] is out of range", msg->bootstrap_pin);
 		return;
 	}
-	if (!set_bootstrap_element(bootstrap_pin, user_setting_level)) {
+	if (!set_bootstrap_element(msg->bootstrap_pin, msg->user_setting_level)) {
 		LOG_ERR("set_bootstrap_element fail");
 		return;
 	}
@@ -1016,8 +982,9 @@ void plat_command_msgq_handler()
 				LOG_ERR("Invalid length for offset: 0x%02x", reg_offset);
 				break;
 			}
-			bootstrap_pin = rdata[1];
-			user_setting_level = rdata[2];
+            msg_data.bootstrap_pin = rdata[1];
+            msg_data.user_setting_level = rdata[2];
+            set_bootstrap_element_handler(&msg_data);
 		} break;
 		case I2C_BRIDGE_COMMAND_REG: {
 			if (rlen < 5) {
@@ -1025,6 +992,11 @@ void plat_command_msgq_handler()
 				break;
 			}
 			size_t payload_len = rlen - 4;
+            if (payload_len > sizeof(msg_data.data)) {
+                LOG_ERR("Bridge payload length %zu exceeds buffer limit (%zu)", 
+                        payload_len, sizeof(msg_data.data));
+                break;
+            }
 
 			msg_data.bus = rdata[1];
 			msg_data.addr = rdata[2];
